@@ -13,6 +13,7 @@ static inline int relocate_block (int from_fd, int to_fd, u_int8_t* buf, ssize_t
 int copy_regular(const char* src_name, const char* dst_name, ssize_t src_size);
 int copy_fifo(const char* dst_name, mode_t src_mode);
 int copy_symlink(const char* src_name, const char* dst_name, ssize_t src_size);
+int copy_device(const char* dst_name, dev_t src_dev_id, mode_t src_dev_mode);
 
 int main(int argc, char* argv[])
 {
@@ -39,6 +40,10 @@ int main(int argc, char* argv[])
             break;
         case __S_IFIFO:
             ret = copy_fifo(argv[2], st_src.st_mode);
+            break;
+        case __S_IFBLK:
+        case __S_IFCHR:
+            ret = copy_device(argv[2], st_src.st_dev, st_src.st_mode);
             break;
         default:
             printf("The source is uncopiable\n");
@@ -145,5 +150,13 @@ int copy_symlink(const char* src_name, const char* dst_name, ssize_t src_size)
         code = 1;
         }
     }
+    return code;
+}
+
+int copy_device(const char* dst_name, dev_t src_dev_id, mode_t src_dev_mode)
+{
+    int code = mknod(dst_name, src_dev_id, src_dev_mode);
+    if (code != 0)
+        perror("Error while copying device file");
     return code;
 }

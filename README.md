@@ -1,3 +1,3 @@
 # my-copy
-Copy regular files, symlinks and FIFOs.
+Copy files - regular or not.
 Usage: copy source_file destination_file.
