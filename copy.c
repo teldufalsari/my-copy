@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -12,7 +13,6 @@
 
 
 #define BLOCK_SIZE 4096 * 256
-#define ABS_PATH 0
 extern int optind;
 static struct copy_options
 {
@@ -64,8 +64,7 @@ int main(int argc, char* argv[])
         return 1;
     }
     struct stat st_dst;
-    int is_src_dir, state = lstat_file_or_dir(argv[2], &st_dst);
-    
+    int is_dst_dir, state = lstat_file_or_dir(argv[2], &st_dst);
     if (state < 0) //The path is totally incorrect
     {
         printf("Error during reading the destination: No such file or directory\n");
@@ -74,7 +73,7 @@ int main(int argc, char* argv[])
     else if (state == 1) //The path is probably correct, but destination file does not exist
     {
         if ((st_dst.st_mode & __S_IFMT) == __S_IFDIR)
-            is_src_dir = 1;
+            is_dst_dir = 1; //Can actually be anything; true since we can copy if the source is a directory
         else
         {
             printf("Error during reading the destination: incorrect path in the filesystem\n");
@@ -82,9 +81,9 @@ int main(int argc, char* argv[])
         }
     }
     else if ((st_dst.st_mode & __S_IFMT) == __S_IFDIR) //The path is correct
-        is_src_dir = 1; 
+        is_dst_dir = 1; 
     else
-        is_src_dir = 0;
+        is_dst_dir = 0;
     
     struct stat st_src;
     if (lstat(argv[1], &st_src) == -1)
@@ -111,21 +110,31 @@ int main(int argc, char* argv[])
             code = copy_device(argv[2], st_src.st_dev, st_src.st_mode);
             break;
         case __S_IFDIR:
-            if (!is_src_dir)
+            if (!is_dst_dir)
                 {
-                    printf("Error: a directory cannot be copied into a file.");
+                    printf("Error: a directory cannot be copied into a file.\n");
                     exit(1);
                 }
             if (dot_or_dotdot(argv[1]))
                 return 0; //Needs to be more informative
-            int src_fd = openat(ABS_PATH, argv[1], __O_DIRECTORY | O_RDONLY);
+            int src_fd = open(argv[1], __O_DIRECTORY | O_RDONLY);
             if (src_fd < 0)
             {
                 perror("Could not open source directory");
                 printf("\t%s\n", argv[1]);
                 return 1;
             }
-            int dst_fd = openat(ABS_PATH, argv[2], __O_DIRECTORY);
+            int dst_fd = open(argv[2], __O_DIRECTORY);
+            if (dst_fd < 0)
+            {
+                if (mkdir(argv[2], 0700))
+                {
+                    perror("Could not create destination directory");
+                    printf("\t%s\n", argv[2]);
+                    return 1;
+                }
+                dst_fd = open(argv[2], __O_DIRECTORY);
+            }
             if (dst_fd < 0)
             {
                 perror("Could not open destination directory");
@@ -334,19 +343,38 @@ void copy_options_init(struct copy_options* x)
 
 int lstat_file_or_dir(char* name, struct stat* buf)
 {
-    int code = lstat(name, buf);
-    if (code == 0)
-        return code;
+    if(lstat(name, buf) == 0) // The path name exists in the filesystem
+        return 0;
     
+    //If the path does not exist
     size_t offset = strlen(name) - 1;
-    while (name[offset] != '/')
-        --offset;
-    name[offset] = '0';
-    code = lstat(name, buf);
+    while ((name[offset] != '/') && (offset))
+        offset--;
+    
+    if (offset == 0) //The destination file/dir is in cwd and does not exist; should be created
+    {
+        char* cwd = get_current_dir_name();
+        if (cwd == NULL)
+        {
+            perror("Cannot read current working directory");
+            return -1;
+        }
+        if (lstat(cwd, buf) != 0)
+        {
+            perror("Cannot open current working directory");
+            free(cwd);
+            return -1;
+        }
+        free(cwd);
+        return 1;
+    }
+
+    name[offset] = '\0';
+    int code = lstat(name, buf);
     name[offset] = '/';
     if (code == 0)
         return 1;
-    return code;
+    return -1;
 }
 
 static inline int dot_or_dotdot(const char* name)
@@ -445,7 +473,7 @@ int do_copy(int srcdir_fd, const char* src_name, int dstdir_fd, const char* dst_
         case __S_IFDIR:
             if (dot_or_dotdot(src_name))
                 return 0; //Needs to be more informative
-            src_fd = openat(srcdir_fd, src_name, __O_DIRECTORY | O_RDONLY);
+            src_fd = openat(srcdir_fd, src_name, __O_DIRECTORY);
             if (src_fd < 0)
             {
                 perror("Could not open source directory");
