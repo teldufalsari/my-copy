@@ -11,10 +11,9 @@
 #define __USE_ATFILE 1
 #include <fcntl.h>
 
-
 #define BLOCK_SIZE 4096 * 256
 extern int optind;
-static struct copy_options
+struct copy_options
 {
     int force_rewrite;
     int follow_symlinks;
@@ -23,7 +22,7 @@ static const char* opt_string = "fs";
 
 static struct copy_options opts;
 
-int lstat_file_or_dir(char* name, struct stat* buf);
+int lstat_file_or_dir(char* name, char** last_name, struct stat* buf, const char* cwd);
 void copy_options_init(struct copy_options* x);
 int copy (int src_fd, int dst_fd, ssize_t src_size);
 static inline int relocate_block (int from_fd, int to_fd, u_int8_t* buf, ssize_t bl_size);
@@ -37,25 +36,27 @@ static inline int copy_device(const char* dst_name, dev_t src_dev_id, mode_t src
 static inline int cpy_device(int dstdir_fd, const char* dst_name, const struct stat* dst_st);
 static inline int copy_dir(int src_fd, int dst_fd);
 static inline int dot_or_dotdot(const char* name);
-int do_copy(int src_fd, const char* src_name, int dst_fd, const char* dst_name);
+int do_copy(int srcdir_fd, const char* src_name, int dstdir_fd, const char* dst_name);
+char* get_last(const char* full_name, size_t length);
 
 int main(int argc, char* argv[])
 {
     umask(0);
     copy_options_init(&opts);
-    int c, code;
+    int c;
     while ((c = getopt(argc, argv, opt_string)) != -1)
     {
         switch(c)
         {
-            case 'l':
-                opts.follow_symlinks = 1;
-                break;
-            case 'f':
-                opts.force_rewrite = 1;
-            default:
-                //Unreachable
-                break;
+        case 'l':
+            opts.follow_symlinks = 1;
+            break;
+        case 'f':
+            opts.force_rewrite = 1;
+            break;
+        default:
+            //Unreachable
+            break;
         }
     }
     if ((argc - optind) < 2)
@@ -63,92 +64,60 @@ int main(int argc, char* argv[])
         printf("Usage: %s [arguments] source_name destination_name\n", argv[0]);
         return 1;
     }
-    struct stat st_dst;
-    int is_dst_dir, state = lstat_file_or_dir(argv[2], &st_dst);
-    if (state < 0) //The path is totally incorrect
+    struct stat st_src;
+    if(lstat(argv[1], &st_src))
     {
-        printf("Error during reading the destination: No such file or directory\n");
+        perror("stst");
         return 1;
     }
-    else if (state == 1) //The path is probably correct, but destination file does not exist
+    char cwd[NAME_MAX] = "";
+    if (getcwd(cwd, NAME_MAX) == NULL)
     {
-        if ((st_dst.st_mode & __S_IFMT) == __S_IFDIR)
-            is_dst_dir = 1; //Can actually be anything; true since we can copy if the source is a directory
-        else
-        {
-            printf("Error during reading the destination: incorrect path in the filesystem\n");
-            return 1;
-        }
+        perror("Could not read current directory");
+        return 4;
+    } 
+    int dst_dirfd = 0, src_dirfd = open(cwd, O_DIRECTORY);
+    struct stat st_dst;
+    char* last_name = NULL;
+    int state = lstat_file_or_dir(argv[2], &last_name, &st_dst, cwd);
+    if (state < 0)
+    {
+        perror("Incorrect path");
+        puts(argv[2]);
+        return 1;
     }
-    else if ((st_dst.st_mode & __S_IFMT) == __S_IFDIR) //The path is correct
-        is_dst_dir = 1; 
-    else
-        is_dst_dir = 0;
-    
-    struct stat st_src;
-    if (lstat(argv[1], &st_src) == -1)
+    state += (((st_dst.st_mode & __S_IFMT) == __S_IFDIR) << 1) + (((st_src.st_mode & __S_IFMT) == __S_IFDIR) << 2);
+    switch (state)
     {
-        perror("Failed to read the source");
-        return 2;
-    }
-    switch (st_src.st_mode & __S_IFMT)
-    {
-        case __S_IFREG:
-            code = copy_regular(argv[1], argv[2], st_src.st_size);
-            break;
-        case __S_IFLNK:
-            if (opts.follow_symlinks)
-                code = copy_regular(argv[1], argv[2], st_src.st_size);
-            else
-                code = copy_symlink(argv[1], argv[2], st_src.st_size);
-            break;
-        case __S_IFIFO:
-            code = copy_fifo(argv[2], st_src.st_mode);
-            break;
-        case __S_IFBLK:
-        case __S_IFCHR:
-            code = copy_device(argv[2], st_src.st_dev, st_src.st_mode);
-            break;
-        case __S_IFDIR:
-            if (!is_dst_dir)
-                {
-                    printf("Error: a directory cannot be copied into a file.\n");
-                    exit(1);
-                }
-            if (dot_or_dotdot(argv[1]))
-                return 0; //Needs to be more informative
-            int src_fd = open(argv[1], __O_DIRECTORY | O_RDONLY);
-            if (src_fd < 0)
-            {
-                perror("Could not open source directory");
-                printf("\t%s\n", argv[1]);
-                return 1;
-            }
-            int dst_fd = open(argv[2], __O_DIRECTORY);
-            if (dst_fd < 0)
-            {
-                if (mkdir(argv[2], 0700))
-                {
-                    perror("Could not create destination directory");
-                    printf("\t%s\n", argv[2]);
-                    return 1;
-                }
-                dst_fd = open(argv[2], __O_DIRECTORY);
-            }
-            if (dst_fd < 0)
-            {
-                perror("Could not open destination directory");
-                printf("\t%s\n", argv[2]);
-                return 1;
-            }
-            code = copy_dir(src_fd, dst_fd);
-            break;
+    case 0:
+        dst_dirfd = src_dirfd;
+        last_name = argv[2];
+        break;
 
-        default:
-            printf("The source is uncopiable\n");
-            code = 1;
+    case 2:
+    case 6:
+        dst_dirfd = open(argv[2], O_DIRECTORY);
+        last_name = get_last(argv[1], strlen(argv[1]));
+        break;
+
+    case 3:
+        dst_dirfd = open(argv[2], O_DIRECTORY);
+        break;
+    
+    case 7:
+        dst_dirfd = open(argv[2], O_DIRECTORY);
+        mkdirat(dst_dirfd, last_name, 0700);
+        break;
+
+    case 4:
+        printf("Cannot copy directory into a file:\n%s to %s\n", argv[1], argv[2]);
+        return 1;
+    
+    default:
+        printf("Incorrect path in the filesystem: no such derectory.\n%s\n", argv[2]);
+        return 1;
     }
-    return code;
+    return do_copy(src_dirfd, argv[1], dst_dirfd, last_name);
 }
 
 int copy (int src_fd, int dst_fd, ssize_t size_left)
@@ -341,7 +310,7 @@ void copy_options_init(struct copy_options* x)
     x->follow_symlinks = 0;
 }
 
-int lstat_file_or_dir(char* name, struct stat* buf)
+int lstat_file_or_dir(char* name, char** last_name, struct stat* buf, const char* cwd)
 {
     if(lstat(name, buf) == 0) // The path name exists in the filesystem
         return 0;
@@ -353,25 +322,19 @@ int lstat_file_or_dir(char* name, struct stat* buf)
     
     if (offset == 0) //The destination file/dir is in cwd and does not exist; should be created
     {
-        char* cwd = get_current_dir_name();
-        if (cwd == NULL)
-        {
-            perror("Cannot read current working directory");
-            return -1;
-        }
         if (lstat(cwd, buf) != 0)
         {
-            perror("Cannot open current working directory");
             free(cwd);
             return -1;
         }
         free(cwd);
+        *last_name = name;
         return 1;
     }
 
     name[offset] = '\0';
+    *last_name = name + offset + 1;
     int code = lstat(name, buf);
-    name[offset] = '/';
     if (code == 0)
         return 1;
     return -1;
@@ -382,7 +345,7 @@ static inline int dot_or_dotdot(const char* name)
     if (name[0] == '.')
     {
         char sep = name[(name[1] == '.') + 1];
-        return ((!sep) || (sep == '/'));
+        return (!sep);
     }
     return 0;
 }
@@ -413,8 +376,7 @@ int copy_dir(int src_fd, int dst_fd)
 }
 
 int do_copy(int srcdir_fd, const char* src_name, int dstdir_fd, const char* dst_name)
-{ 
-    printf("dstdir = (%i)\tdstname = '%s'\n", dstdir_fd, dst_name);
+{
     struct stat src_stat;
     if (fstatat(srcdir_fd, src_name, &src_stat, AT_SYMLINK_NOFOLLOW))
     {
@@ -423,109 +385,118 @@ int do_copy(int srcdir_fd, const char* src_name, int dstdir_fd, const char* dst_
     }
 
     int code = 0;
+    int src_fd, dst_fd;
     switch (src_stat.st_mode & __S_IFMT)
     {
-        int src_fd, dst_fd;
-        case __S_IFLNK:
-            if (!opts.follow_symlinks)
-            {
-                code = cpy_symlink(srcdir_fd, dstdir_fd, src_name, dst_name, src_stat.st_size);
-                break;
-            }
-            else 
-            {
-                //Falling down and copying the file the link is poiting to
-            }
-    
-        case __S_IFREG:
-            src_fd = openat(srcdir_fd, src_name, O_RDONLY);
-            if (src_fd < 0)
-            {
-                perror("Failed to open the source");
-                return 2;
-            }
-            dst_fd = openat(dstdir_fd, dst_name, O_CREAT | O_TRUNC | O_WRONLY, 0600);
-            if (dst_fd < 0)
-            {
-                perror("Failed to open the destination");
-                printf("\t%s at %i\n", dst_name, dstdir_fd);
-                close(src_fd);
-                return 2;
-            }
-            code = cpy_regular(src_fd, dst_fd, src_stat.st_size);
+    case __S_IFLNK:
+        if (!opts.follow_symlinks)
+        {
+            code = cpy_symlink(srcdir_fd, dstdir_fd, src_name, dst_name, src_stat.st_size);
+            break;
+        }
+        else 
+        {
+            //Falling down and copying the file the link is poiting to
+        }
+
+    case __S_IFREG:
+        src_fd = openat(srcdir_fd, src_name, O_RDONLY);
+        if (src_fd < 0)
+        {
+            perror("Failed to open the source");
+            return 2;
+        }
+        dst_fd = openat(dstdir_fd, dst_name, O_CREAT | O_TRUNC | O_WRONLY, 0600);
+        if (dst_fd < 0)
+        {
+            perror("Failed to open destination");
+            printf("\t%s at %i\n", dst_name, dstdir_fd);
             close(src_fd);
-            if (close(dst_fd))
-            {
-                perror("Error durind writing file");
-                code = 1;
-            }
-            break;
-
-        case __S_IFIFO:
-            code = cpy_fifo(dstdir_fd, dst_name, src_stat.st_mode);
-            break;
-
-        case __S_IFBLK:
-        case __S_IFCHR:
-            code = cpy_device(dstdir_fd, dst_name, &src_stat);
-            break;
-
-        case __S_IFDIR:
-            if (dot_or_dotdot(src_name))
-                return 0; //Needs to be more informative
-            src_fd = openat(srcdir_fd, src_name, __O_DIRECTORY);
-            if (src_fd < 0)
-            {
-                perror("Could not open source directory");
-                return 1;
-            }
-            dst_fd = openat(dstdir_fd, dst_name, __O_DIRECTORY);/// This moment must be overlooked more thoroughly
-            if (dst_fd < 0)
-            {
-                if ((errno == ENOTDIR) && (opts.force_rewrite == 1)) //The file exists but it's not a directory
-                {
-                    if (unlinkat(dstdir_fd, dst_name, 0)) //So we delete it
-                        {
-                            perror("Could not rewrite file");
-                            printf("\t%s\n", dst_name);
-                            return 1;
-                        }
-                    if (mkdirat(dstdir_fd, dst_name, 0700)) //And create a directory with the name specified
-                    {
-                        perror("Could not create a directory");
-                        printf("\t%s\n", dst_name);
-                        return 1;
-                    }
-                }
-                else //Possibly there are no files or directories called dst_name
-                {
-                    if (mkdirat(dstdir_fd, dst_name, 0700)) //And create a directory with the name specified
-                    {
-                        perror("Could not create a directory");
-                        printf("\t%s\n", dst_name);
-                        return 1;
-                    }
-                }
-            }
-            dst_fd = openat(dstdir_fd, dst_name, __O_DIRECTORY);/// Once again...
-            if (dst_fd < 0)
-            {
-                perror("Could not open the directory for copying");
-                printf("\t%s\n", dst_name);
-                return 1;
-            }
-            
-            code = copy_dir(src_fd, dst_fd);
-            close(src_fd);
-            if (close(dst_fd))
-            {
-                perror("Error durind writing directory");
-                code = 1;
-            }
-            break;
-        default:
-            printf("The source is uncopiable\n");
+            return 2;
+        }
+        code = cpy_regular(src_fd, dst_fd, src_stat.st_size);
+        close(src_fd);
+        if (close(dst_fd))
+        {
+            perror("Error durind writing file");
             code = 1;
+        }
+        break;
+
+    case __S_IFIFO:
+        code = cpy_fifo(dstdir_fd, dst_name, src_stat.st_mode);
+        break;
+
+    case __S_IFBLK:
+    case __S_IFCHR:
+        code = cpy_device(dstdir_fd, dst_name, &src_stat);
+        break;
+
+    case __S_IFDIR:
+        if (dot_or_dotdot(src_name))
+            return 0; //Needs to be more informative
+        src_fd = openat(srcdir_fd, src_name, __O_DIRECTORY);
+        if (src_fd < 0)
+        {
+            perror("Could not open source directory");
+            return 1;
+        }
+        dst_fd = openat(dstdir_fd, dst_name, __O_DIRECTORY);/// This moment must be overlooked more thoroughly
+        if (dst_fd < 0)
+        {
+            if ((errno == ENOTDIR) && (opts.force_rewrite == 1)) //The file exists but it's not a directory
+            {
+                if (unlinkat(dstdir_fd, dst_name, 0)) //So we delete it
+                    {
+                        perror("Could not rewrite file");
+                        printf("\t%s\n", dst_name);
+                        return 1;
+                    }
+                if (mkdirat(dstdir_fd, dst_name, 0700)) //And create a directory with the name specified
+                {
+                    perror("Could not create a directory");
+                    printf("\t%s\n", dst_name);
+                    return 1;
+                }
+            }
+            else //Possibly there are no files or directories called dst_name
+            {
+                if (mkdirat(dstdir_fd, dst_name, 0700)) //And create a directory with the name specified
+                {
+                    perror("Could not create a directory");
+                    printf("\t%s\n", dst_name);
+                    return 1;
+                }
+            }
+        }
+        dst_fd = openat(dstdir_fd, dst_name, __O_DIRECTORY);/// Once again...
+        if (dst_fd < 0)
+        {
+            perror("Could not open the directory for copying");
+            printf("\t%s\n", dst_name);
+            return 1;
+        }
+        code = copy_dir(src_fd, dst_fd);
+        close(src_fd);
+        if (close(dst_fd))
+        {
+            perror("Error durind writing directory");
+            code = 1;
+        }
+        break;
+    default:
+        printf("The source is uncopiable\n");
+        code = 1;
     }
     return code;
+}
+
+char* get_last(const char* full_name, size_t length)
+{
+    length -= 1;
+    if (full_name[length] == '/')
+        length--;
+    while((full_name[length] != '/') && length)
+        length--;
+    return full_name + length + 1;
 }
